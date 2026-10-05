@@ -368,7 +368,7 @@ class CosmosDBDAO(BaseDAO):
                 # same client/session: Session consistency guarantees the token is
                 # honored, but under real write throughput the request can still
                 # land on a replica that hasn't caught up yet. Retry a few times
-                # before concluding the document genuinely doesn't exist.
+                # before falling back.
                 current = None
                 delay = 0.1
                 for attempt in range(_READ_AFTER_WRITE_RETRIES):
@@ -379,12 +379,33 @@ class CosmosDBDAO(BaseDAO):
                         break
                     except exceptions.CosmosResourceNotFoundError:
                         if attempt == _READ_AFTER_WRITE_RETRIES - 1:
-                            raise ObjectNotFoundError(
-                                f"`{self.entity_cls.__name__}` object with identifier "
-                                f"{item_id} does not exist."
-                            )
+                            break
                         time.sleep(delay)
                         delay *= 2
+
+                if current is None:
+                    # The read never caught up within the retry budget. Reads can
+                    # land on a lagging secondary replica, but writes always go to
+                    # the primary and are not subject to this lag — so fall back to
+                    # an unconditional write (skipping the optimistic-concurrency
+                    # check for this one update) rather than keep waiting on a read
+                    # that may lag for several seconds under real load. If the
+                    # document genuinely doesn't exist, this write surfaces that
+                    # authoritatively instead of a read-routing artifact.
+                    logger.warning(
+                        f"`{self.entity_cls.__name__}` object with identifier {item_id} "
+                        "was not visible to a read after exhausting retries; falling "
+                        "back to an unconditional write (version check skipped for "
+                        "this update)."
+                    )
+                    try:
+                        container.replace_item(item=item_id, body=model_obj)
+                    except exceptions.CosmosResourceNotFoundError:
+                        raise ObjectNotFoundError(
+                            f"`{self.entity_cls.__name__}` object with identifier "
+                            f"{item_id} does not exist."
+                        )
+                    return model_obj
 
                 stored_version = current.get("_version")
                 if stored_version != expected_version:
