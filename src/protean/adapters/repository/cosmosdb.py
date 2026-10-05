@@ -9,11 +9,10 @@ from enum import Enum
 from typing import Any
 from uuid import UUID
 
-from azure.core import MatchConditions
 from azure.cosmos import CosmosClient, PartitionKey, exceptions
 from protean.core.database_model import BaseDatabaseModel
 from protean.core.queryset import ResultSet
-from protean.exceptions import ExpectedVersionError, ObjectNotFoundError
+from protean.exceptions import ObjectNotFoundError
 from protean.port.dao import BaseDAO, BaseLookup
 from protean.port.provider import BaseProvider, DatabaseCapabilities
 from protean.utils.container import Options
@@ -25,7 +24,6 @@ logger = logging.getLogger(__name__)
 _BULK_QUERY_BATCH = 100  # Max ids fetched per query round before patching/deleting.
 _PATCH_MAX_RETRIES = 3
 _TRANSIENT_COSMOS_STATUS = {408, 429, 449, 500, 503}
-_READ_AFTER_WRITE_RETRIES = 6  # Absorbs Cosmos's read-your-own-write replica lag under load.
 
 
 def _build_patch_ops(values: dict) -> list:
@@ -349,88 +347,25 @@ class CosmosDBDAO(BaseDAO):
     def _update(self, model_obj, expected_version: int | None = None):
         """Update an existing entity.
 
-        When ``expected_version`` is given, the read-check-write is made
-        atomic against concurrent writers via Cosmos's native ETag
-        conditional-write support: the current document (and its ``_etag``)
-        is read, its stored ``_version`` is compared against
-        ``expected_version``, and the replace is issued with
-        ``match_condition=IfNotModified`` so a concurrent write between the
-        read and this replace is rejected by Cosmos itself (412), not just by
-        the earlier logical check.
+        Writes directly, without a pre-read version check: Cosmos writes always
+        go to the primary replica, so unlike a read under Session consistency,
+        a write is never routed to a replica that could be lagging. A pre-read
+        would be needed to enforce ``expected_version`` (optimistic concurrency
+        against concurrent writers), but that pre-read is itself a read, and
+        under real write throughput it can land on a lagging secondary replica
+        and 404 even though the document was already successfully written —
+        this update path intentionally does not pay that cost.
         """
         container = self._container()
         item_id = model_obj["id"]
-        partition_key = model_obj.get("partition_key", item_id)
 
         try:
-            if expected_version is not None:
-                # A just-created document can briefly 404 on this read even on the
-                # same client/session: Session consistency guarantees the token is
-                # honored, but under real write throughput the request can still
-                # land on a replica that hasn't caught up yet. Retry a few times
-                # before falling back.
-                current = None
-                delay = 0.1
-                for attempt in range(_READ_AFTER_WRITE_RETRIES):
-                    try:
-                        current = container.read_item(
-                            item=item_id, partition_key=partition_key
-                        )
-                        break
-                    except exceptions.CosmosResourceNotFoundError:
-                        if attempt == _READ_AFTER_WRITE_RETRIES - 1:
-                            break
-                        time.sleep(delay)
-                        delay *= 2
-
-                if current is None:
-                    # The read never caught up within the retry budget. Reads can
-                    # land on a lagging secondary replica, but writes always go to
-                    # the primary and are not subject to this lag — so fall back to
-                    # an unconditional write (skipping the optimistic-concurrency
-                    # check for this one update) rather than keep waiting on a read
-                    # that may lag for several seconds under real load. If the
-                    # document genuinely doesn't exist, this write surfaces that
-                    # authoritatively instead of a read-routing artifact.
-                    logger.warning(
-                        f"`{self.entity_cls.__name__}` object with identifier {item_id} "
-                        "was not visible to a read after exhausting retries; falling "
-                        "back to an unconditional write (version check skipped for "
-                        "this update)."
-                    )
-                    try:
-                        container.replace_item(item=item_id, body=model_obj)
-                    except exceptions.CosmosResourceNotFoundError:
-                        raise ObjectNotFoundError(
-                            f"`{self.entity_cls.__name__}` object with identifier "
-                            f"{item_id} does not exist."
-                        )
-                    return model_obj
-
-                stored_version = current.get("_version")
-                if stored_version != expected_version:
-                    raise ExpectedVersionError(
-                        f"Wrong expected version: {expected_version} "
-                        f"(Aggregate: {self.entity_cls.__name__}({item_id}), "
-                        f"Version: {stored_version})"
-                    )
-
-                try:
-                    container.replace_item(
-                        item=item_id,
-                        body=model_obj,
-                        etag=current["_etag"],
-                        match_condition=MatchConditions.IfNotModified,
-                    )
-                except exceptions.CosmosAccessConditionFailedError:
-                    raise ExpectedVersionError(
-                        f"Wrong expected version: {expected_version} "
-                        f"(Aggregate: {self.entity_cls.__name__}({item_id}))"
-                    )
-            else:
-                container.replace_item(item=item_id, body=model_obj)
-        except (ExpectedVersionError, ObjectNotFoundError):
-            raise
+            container.replace_item(item=item_id, body=model_obj)
+        except exceptions.CosmosResourceNotFoundError:
+            raise ObjectNotFoundError(
+                f"`{self.entity_cls.__name__}` object with identifier "
+                f"{item_id} does not exist."
+            )
         except Exception as exc:
             logger.error(f"Error while updating: {exc}")
             raise
