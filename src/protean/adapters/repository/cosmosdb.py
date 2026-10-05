@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 _BULK_QUERY_BATCH = 100  # Max ids fetched per query round before patching/deleting.
 _PATCH_MAX_RETRIES = 3
 _TRANSIENT_COSMOS_STATUS = {408, 429, 449, 500, 503}
-_READ_AFTER_WRITE_RETRIES = 3  # Absorbs Cosmos's read-your-own-write replica lag under load.
+_READ_AFTER_WRITE_RETRIES = 6  # Absorbs Cosmos's read-your-own-write replica lag under load.
 
 
 def _build_patch_ops(values: dict) -> list:
@@ -370,7 +370,7 @@ class CosmosDBDAO(BaseDAO):
                 # land on a replica that hasn't caught up yet. Retry a few times
                 # before concluding the document genuinely doesn't exist.
                 current = None
-                delay = 0.05
+                delay = 0.1
                 for attempt in range(_READ_AFTER_WRITE_RETRIES):
                     try:
                         current = container.read_item(
