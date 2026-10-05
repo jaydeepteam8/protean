@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 _BULK_QUERY_BATCH = 100  # Max ids fetched per query round before patching/deleting.
 _PATCH_MAX_RETRIES = 3
 _TRANSIENT_COSMOS_STATUS = {408, 429, 449, 500, 503}
+_READ_AFTER_WRITE_RETRIES = 3  # Absorbs Cosmos's read-your-own-write replica lag under load.
 
 
 def _build_patch_ops(values: dict) -> list:
@@ -363,15 +364,27 @@ class CosmosDBDAO(BaseDAO):
 
         try:
             if expected_version is not None:
-                try:
-                    current = container.read_item(
-                        item=item_id, partition_key=partition_key
-                    )
-                except exceptions.CosmosResourceNotFoundError:
-                    raise ObjectNotFoundError(
-                        f"`{self.entity_cls.__name__}` object with identifier "
-                        f"{item_id} does not exist."
-                    )
+                # A just-created document can briefly 404 on this read even on the
+                # same client/session: Session consistency guarantees the token is
+                # honored, but under real write throughput the request can still
+                # land on a replica that hasn't caught up yet. Retry a few times
+                # before concluding the document genuinely doesn't exist.
+                current = None
+                delay = 0.05
+                for attempt in range(_READ_AFTER_WRITE_RETRIES):
+                    try:
+                        current = container.read_item(
+                            item=item_id, partition_key=partition_key
+                        )
+                        break
+                    except exceptions.CosmosResourceNotFoundError:
+                        if attempt == _READ_AFTER_WRITE_RETRIES - 1:
+                            raise ObjectNotFoundError(
+                                f"`{self.entity_cls.__name__}` object with identifier "
+                                f"{item_id} does not exist."
+                            )
+                        time.sleep(delay)
+                        delay *= 2
 
                 stored_version = current.get("_version")
                 if stored_version != expected_version:
