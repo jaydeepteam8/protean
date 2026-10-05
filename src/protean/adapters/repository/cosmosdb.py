@@ -89,6 +89,7 @@ class CosmosDBProvider(BaseProvider):
 
     def __init__(self, name, domain, conn_info: dict):
         """Initialize Provider with Connection/Adapter details"""
+        self._cosmos_client = None
         self.client = None
         self.database = None
         self.container = None
@@ -125,11 +126,22 @@ class CosmosDBProvider(BaseProvider):
         )
 
     def get_connection(self):
-        """Get the connection object for the repository"""
-        conn = CosmosClient(
-            self.conn_info["database_uri"], self.conn_info["database_key"]
+        """Get the connection object for the repository.
+
+        Reuses a single CosmosClient for the provider's lifetime instead of
+        constructing one per call. The SDK ties session-consistency tokens
+        (read-your-own-writes) to the client instance, so a fresh client per
+        call drops that continuity - a write followed immediately by a read
+        on a new client can race a replica that hasn't caught up yet and
+        come back as not-found even though the write already succeeded.
+        """
+        if self._cosmos_client is None:
+            self._cosmos_client = CosmosClient(
+                self.conn_info["database_uri"], self.conn_info["database_key"]
+            )
+        self.database = self._cosmos_client.get_database_client(
+            self.conn_info["database_name"]
         )
-        self.database = conn.get_database_client(self.conn_info["database_name"])
         self.client = self.database
         return self.client
 
@@ -233,6 +245,7 @@ class CosmosDBProvider(BaseProvider):
 
     def close(self):
         """Close connection to CosmosDB."""
+        self._cosmos_client = None
         self.client = None
         self.database = None
 
