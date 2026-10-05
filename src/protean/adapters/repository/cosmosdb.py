@@ -269,7 +269,7 @@ class CosmosDBProvider(BaseProvider):
             if not self.owns(cls):
                 continue
             dao = self.domain.repository_for(cls)._dao
-            schema_names.append(derive_schema_name(dao.model_cls))
+            schema_names.append(derive_schema_name(dao.database_model_cls))
         return schema_names
 
     def _create_database_artifacts(self) -> None:
@@ -321,7 +321,7 @@ class CosmosDBDAO(BaseDAO):
 
     def _container(self):
         conn = self.provider.get_connection()
-        return conn.get_container_client(derive_schema_name(self.model_cls))
+        return conn.get_container_client(derive_schema_name(self.database_model_cls))
 
     def _create(self, model_obj):
         """Add a new entity to CosmosDB."""
@@ -412,7 +412,7 @@ class CosmosDBDAO(BaseDAO):
     def has_table(self) -> bool:
         """Check if this entity's container exists."""
         conn = self.provider.get_connection()
-        schema_name = derive_schema_name(self.model_cls)
+        schema_name = derive_schema_name(self.database_model_cls)
         return schema_name in [c["id"] for c in conn.list_containers()]
 
     def _query_parameters(self, params):
